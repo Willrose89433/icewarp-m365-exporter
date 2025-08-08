@@ -8,29 +8,29 @@
 
 ### --2. Build the container--
 
-  '''
+  ```
    docker-compose build
-   '''
+   ```
    
 ### --3. Start the service--
 
-   '''
+  ```
    docker-compose up -d
-   '''
+   ```
 
 ### --4. Check logs--
 
-'''
+```
    docker-compose logs -f
-   '''
+  ```
 
 ### --5. Trigger export--
 
-'''
+```
    curl -X POST http://localhost:3000/export \
      -H "Content-Type: application/json" \
      -d '{"users":["user1@example.com","user2@example.com"]}'
-     '''
+    ```
 
 ### --6. Get the report--
 
