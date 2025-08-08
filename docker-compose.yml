@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  icewarp-m365-exporter:
+    build: .
+    container_name: icewarp-m365-exporter
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      ICEWARP_HOST: "your.icewarp.server"
+      ICEWARP_PORT: "443"
+      ICEWARP_ADMIN_USER: "admin@example.com"
+      ICEWARP_ADMIN_PASS: "your_icewarp_password"
+      M365_TENANT_ID: "your_tenant_id"
+      M365_CLIENT_ID: "your_client_id"
+      M365_CLIENT_SECRET: "your_client_secret"
+    volumes:
+      - ./reports:/app/reports
