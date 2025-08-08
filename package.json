@@ -1,0 +1,20 @@
+{
+  "name": "icewarp-m365-exporter",
+  "version": "1.0.0",
+  "description": "Exporter to migrate contacts (VCF) and calendar events (ICS) from IceWarp WebDAV to Microsoft 365 (Graph API)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.4.0",
+    "csv-writer": "^1.6.0",
+    "express": "^4.18.2",
+    "form-data": "^4.0.0",
+    "node-ical": "^1.11.0",
+    "p-limit": "^4.0.0",
+    "webdav": "^4.7.1",
+    "vcf": "^2.0.1",
+    "winston": "^3.9.0"
+  }
+}

@@ -10,4 +10,9 @@ This project migrates contacts (VCF) and calendar events (ICS) from IceWarp via 
 - CSV reporting (success/failure) saved under `reports/` with downloadable link.
 - Winston logging (file + console).
 
+## Quickstart
 
+1. Install dependencies:
+
+```bash
+npm install
