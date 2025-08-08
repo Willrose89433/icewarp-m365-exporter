@@ -31,7 +31,7 @@
      -H "Content-Type: application/json" \
      -d '{"users":["user1@example.com","user2@example.com"]}'
 ```
-    ```
+    
 
 ### --6. Get the report--
 
