@@ -1,0 +1,3 @@
+ reads VCF and ICS from IceWarp over WebDAV, parses them in-browser, and imports contacts & events into Microsoft 365 via the Graph API. It includes token caching, batching, retries, error logging, and clear TODOs for production tweaks (scopes, throttling rules, secure secret storage). Drop your real values into the CONFIG block and it should be ready to run (or run from a secure server environment — see the security notes below).
+
+Important security note: embedding long-lived client secrets in front-end code is unsafe. For production, run the token exchange on a secure backend and call the backend from this UI. This code is appropriate for a trusted internal admin page or for running inside a secure admin machine.
