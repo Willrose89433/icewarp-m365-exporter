@@ -1,0 +1,31 @@
+Quick next steps for you
+Unzip, cd into the folder, and run npm install.
+
+Set environment variables (recommended) or edit server.js with your real values:
+
+ICEWARP_HOST, ICEWARP_PORT, ICEWARP_ADMIN_USER, ICEWARP_ADMIN_PASS
+
+M365_TENANT_ID, M365_CLIENT_ID, M365_CLIENT_SECRET
+
+Start server: npm start
+
+Trigger export:
+
+POST http://<server>:3000/export with optional JSON body { "users": ["user1@example.com","user2@example.com"] }
+
+Response contains report path (e.g. /reports/export-report-...csv) you can download.
+
+Caveats & production hardening (already noted in README)
+Do not run with client secret in source on public machines; use environment variables or a secrets manager.
+
+Adjust IceWarp paths (the code assumes /users/<username>/Contacts/ and /users/<username>/Calendar/). If your IceWarp layout differs, update lib/icewarp.js.
+
+Consider adding:
+
+Rate-limit handling for Graph (inspect 429 responses to back off longer).
+
+Support for very large mailboxes via job queue and resume points.
+
+More comprehensive vCard fields mapping (addresses, multiple emails, photos).
+
+Unit tests, and CI deployment.
