@@ -30,6 +30,7 @@
    curl -X POST http://localhost:3000/export \
      -H "Content-Type: application/json" \
      -d '{"users":["user1@example.com","user2@example.com"]}'
+
     ```
 
 ### --6. Get the report--
