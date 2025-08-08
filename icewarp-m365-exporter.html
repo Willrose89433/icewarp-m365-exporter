@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>IceWarp → Microsoft 365 Exporter (VCF/ICS parsing)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- WebDAV client -->
+  <script src="https://cdn.jsdelivr.net/npm/webdav@4.7.1/webdav.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; padding: 18px; }
+    pre { background:#111; color:#0f0; padding:12px; max-height: 50vh; overflow:auto; }
+    button { padding:8px 12px; margin:8px 0; }
+    .small { font-size:0.9rem; color:#666; }
+  </style>
+</head>
+<body>
+  <h1>IceWarp → Microsoft 365 Exporter</h1>
+  <div class="small">Parses VCF & ICS from IceWarp WebDAV and imports into users' M365 mailboxes.</div>
+  <button id="startBtn">Start Export</button>
+  <pre id="log"></pre>
+
+<script>
+/* ============================
+   CONFIG - update before use
+   ============================ */
+const CONFIG = {
+  IceWarpHost: 'your-icewarp-host.com',    // IceWarp host (no https://)
+  IceWarpPort: 8383,                       // IceWarp port (WebDAV)
+  IceWarpAdminUser: 'icewarp-admin',       // account with access to users' folders
+  IceWarpAdminPass: 'icewarp-admin-pass',
+
+  // Optionally pre-list users here to avoid auto-discovery
+  Users: [
+    // { username: 'user1@example.com', TimeZone: 'UTC' }
+  ],
+
+  // Microsoft (use backend recommended for secrets)
+  M365TenantId: 'your-tenant-id',
+  M365ClientId: 'your-client-id',
+  M365ClientSecret: 'your-client-secret',  // <-- do NOT store in public front-ends for prod
+  GraphBatchSize: 20,      // concurrent requests per user
+  GraphRetryAttempts: 3,   // per item
+  GraphRetryBaseMs: 500    // backoff base
+};
+
+/* ============================
+   UI / Logging
+   ============================ */
+const logEl = document.getElementById('log');
+function log(...args) {
+  const line = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+  logEl.textContent += line + '\n';
+  console.log(...args);
+}
+function clearLog(){ logEl.textContent = ''; }
+
+/* ============================
+   Token caching & Graph auth
+   ============================ */
+let _tokenCache = { token: null, expiresAt: 0 };
+async function getGraphToken() {
+  const now = Date.now();
+  if (_tokenCache.token && _tokenCache.expiresAt - 15000 > now) return _tokenCache.token;
+
+  const url = `https://login.microsoftonline.com/${CONFIG.M365TenantId}/oauth2/v2.0/token`;
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: CONFIG.M365ClientId,
+    client_secret: CONFIG.M365ClientSecret,
+    scope: 'https://graph.microsoft.com/.default'
+  });
+
+  const res = await fetch(url, { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Token error: ${data.error_description || JSON.stringify(data)}`);
+  }
+  _tokenCache.token = data.access_token;
+  _tokenCache.expiresAt = Date.now() + (data.expires_in || 3599) * 1000;
+  log('🔐 Obtained Graph token (cached until ' + new Date(_tokenCache.expiresAt).toISOString() + ')');
+  return _tokenCache.token;
+}
+
+/* ============================
+   IceWarp WebDAV helpers
+   ============================ */
+function getWebDAVClient() {
+  return window.webdav.createClient(
+    `https://${CONFIG.IceWarpHost}:${CONFIG.IceWarpPort}`,
+    { username: CONFIG.IceWarpAdminUser, password: CONFIG.IceWarpAdminPass, maxBodyLength: Infinity }
+  );
+}
+
+/**
+ * Attempt to discover users by listing /users/ directory.
+ * Fallback to CONFIG.Users if discovery not possible.
+ */
+async function discoverIceWarpUsers() {
+  if (CONFIG.Users && CONFIG.Users.length) return CONFIG.Users;
+  try {
+    const client = getWebDAVClient();
+    const usersDir = '/users/'; // adjust if your IceWarp uses different root
+    log(`📡 Discovering users under ${usersDir}...`);
+    const list = await client.getDirectoryContents(usersDir);
+    // list items often have .type 'directory' and .basename or .filename with path
+    const users = list.filter(i => i.type === 'directory').map(i => {
+      const name = i.basename || i.filename.split('/').filter(Boolean).pop();
+      // Assume username is name@domain — if not, user must supply exact usernames
+      return { username: name, TimeZone: 'UTC' };
+    });
+
+    if (users.length === 0) throw new Error('No users discovered');
+    log(`✅ Discovered ${users.length} users (first 5): ${users.slice(0,5).map(u=>u.username).join(', ')}`);
+    return users;
+  } catch (err) {
+    log(`⚠️ Could not auto-discover users: ${err.message}. Falling back to CONFIG.Users`);
+    if (!CONFIG.Users || !CONFIG.Users.length) throw new Error('No users configured. Please populate CONFIG.Users');
+    return CONFIG.Users;
+  }
+}
+
+/* ============================
+   Parsers: VCF (vCard) & ICS (iCalendar)
+   Lightweight — covers common fields we need.
+   ============================ */
+
+/* Parse VCF content — returns array of contact objects */
+function parseVCard(vcfText) {
+  // Normalize line continuations (folding) per RFC: lines starting with space/tab are continuation
+  vcfText = vcfText.replace(/\r\n|\r/g,"\n").replace(/\n[ \t]/g,''); // unfold
+  const cards = vcfText.split(/BEGIN:VCARD/i).slice(1);
+  const contacts = [];
+
+  for (const cardRaw of cards) {
+    const card = 'BEGIN:VCARD\n' + cardRaw;
+    const obj = {};
+    const lines = card.split(/\n/);
+    for (let raw of lines) {
+      raw = raw.trim();
+      if (!raw || raw.match(/^BEGIN:VCARD/i) || raw.match(/^END:VCARD/i)) continue;
+      const [keyPart, ...valParts] = raw.split(':');
+      if (!keyPart) continue;
+      const val = valParts.join(':');
+      const key = keyPart.split(';')[0].toUpperCase();
+
+      if (key === 'FN') obj.fullName = val;
+      else if (key === 'N') {
+        // N:Surname;Given;Additional;Prefix;Suffix
+        const parts = val.split(';');
+        obj.surname = parts[0] || '';
+        obj.givenName = parts[1] || '';
+      } else if (key.startsWith('TEL')) {
+        obj.phones = obj.phones || [];
+        obj.phones.push(val);
+      } else if (key.startsWith('EMAIL')) {
+        obj.emails = obj.emails || [];
+        obj.emails.push(val);
+      } else if (key === 'ORG') obj.organization = val;
+      else if (key === 'TITLE') obj.title = val;
+      else if (key === 'ADR') {
+        // ADR;TYPE=WORK:;;Street;City;Region;Postal;Country
+        const adrParts = val.split(';');
+        obj.address = {
+          street: adrParts[2] || '',
+          city: adrParts[3] || '',
+          state: adrParts[4] || '',
+          postalCode: adrParts[5] || '',
+          countryOrRegion: adrParts[6] || ''
+        };
+      }
+    }
+    // Map to Graph contact shape (minimal)
+    const graphContact = {
+      givenName: obj.givenName || obj.fullName || '',
+      surname: obj.surname || '',
+      companyName: obj.organization || '',
+      jobTitle: obj.title || '',
+      businessPhones: obj.phones || [],
+      emailAddresses: (obj.emails || []).map(e => ({ address: e, name: '' })),
+      homeAddress: obj.address || {}
+    };
+    contacts.push(graphContact);
+  }
+  return contacts;
+}
+
+/* Parse ICS and return array of event objects for Microsoft Graph */
+function parseICS(icsText, defaultTimeZone='UTC') {
+  icsText = icsText.replace(/\r\n|\r/g,"\n").replace(/\n[ \t]/g,''); // unfold
+  const vevents = icsText.split(/BEGIN:VEVENT/i).slice(1);
+  const events = [];
+
+  for (const evRaw of vevents) {
+    const ev = 'BEGIN:VEVENT\n' + evRaw;
+    const lines = ev.split(/\n/);
+    const e = { attendees: [] };
+
+    for (let raw of lines) {
+      raw = raw.trim();
+      if (!raw || raw.match(/^BEGIN:VEVENT/i) || raw.match(/^END:VEVENT/i)) continue;
+      const [keyPart, ...valParts] = raw.split(':');
+      if (!keyPart) continue;
+      const val = valParts.join(':');
+      const keyUp = keyPart.toUpperCase();
+
+      if (keyUp.startsWith('SUMMARY')) e.subject = val;
+      else if (keyUp.startsWith('DESCRIPTION')) e.body = { contentType: 'Text', content: val };
+      else if (keyUp.startsWith('DTSTART')) e.start = { dateTime: parseICalDate(val), timeZone: defaultTimeZone };
+      else if (keyUp.startsWith('DTEND')) e.end = { dateTime: parseICalDate(val), timeZone: defaultTimeZone };
+      else if (keyUp.startsWith('ATTENDEE')) {
+        // ATTENDEE;CN=Name:mailto:email@example.com
+        const m = val.match(/mailto:(.+)/i);
+        if (m) e.attendees.push({ emailAddress: { address: m[1], name: '' }, type: 'required' });
+      } else if (keyUp.startsWith('LOCATION')) e.location = { displayName: val };
+    }
+
+    // Ensure minimal required fields exist
+    if (!e.start) e.start = { dateTime: new Date().toISOString(), timeZone: defaultTimeZone };
+    if (!e.end) {
+      const dt = new Date(e.start.dateTime);
+      dt.setHours(dt.getHours() + 1);
+      e.end = { dateTime: dt.toISOString(), timeZone: defaultTimeZone };
+    }
+    if (!e.body) e.body = { contentType:'Text', content: '' };
+    events.push(e);
+  }
+
+  return events;
+}
+
+/* Parse iCal date strings (YYYYMMDDTHHMMSSZ, YYYYMMDD, with or without Z) -> RFC3339 string */
+function parseICalDate(value) {
+  // If value contains 'T' it's date-time, else it's a date
+  // Support value like 20250809T100000Z or 20250809T100000 or 20250809
+  if (/^\d{8}T\d{6}Z$/.test(value)) {
+    // UTC
+    const y=value.substr(0,4), m=value.substr(4,2), d=value.substr(6,2), hh=value.substr(9,2), mm=value.substr(11,2), ss=value.substr(13,2);
+    return new Date(Date.UTC(y, m-1, d, hh, mm, ss)).toISOString();
+  }
+  if (/^\d{8}T\d{6}$/.test(value)) {
+    // naive local time - treat as UTC to avoid TZ complexity here (or set to default TZ)
+    const y=value.substr(0,4), m=value.substr(4,2), d=value.substr(6,2), hh=value.substr(9,2), mm=value.substr(11,2), ss=value.substr(13,2);
+    // Return ISO local (no timezone offset) — Graph expects RFC3339 with timezone; we'll append 'Z'
+    return new Date(Date.UTC(y, m-1, d, hh, mm, ss)).toISOString();
+  }
+  if (/^\d{8}$/.test(value)) {
+    // all-day event
+    const y=value.substr(0,4), m=value.substr(4,2), d=value.substr(6,2);
+    return new Date(Date.UTC(y, m-1, d, 0,0,0)).toISOString();
+  }
+  // fallback
+  const parsed = new Date(value);
+  return isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+}
+
+/* ============================
+   IceWarp: get contacts and calendars
+   ============================ */
+async function getContactsFromIceWarpForUser(user) {
+  try {
+    const client = getWebDAVClient();
+    const contactsPath = `/users/${user.username}/Contacts/`; // adjust as needed
+    log(`🔎 Listing contacts folder: ${contactsPath}`);
+    const list = await client.getDirectoryContents(contactsPath);
+    if (!list || !list.length) { log(`⚠️ No contact files for ${user.username}`); return []; }
+
+    const vcfFiles = list.filter(i => i.type === 'file' && i.basename && i.basename.toLowerCase().endsWith('.vcf'));
+    const contacts = [];
+    for (const f of vcfFiles) {
+      try {
+        const content = await client.getFileContents(f.filename, { format: "text" });
+        const parsed = parseVCard(content);
+        contacts.push(...parsed);
+      } catch (err) {
+        log(`❌ Failed to read ${f.filename} for ${user.username}: ${err.message}`);
+      }
+    }
+    log(`📥 Parsed ${contacts.length} contacts for ${user.username}`);
+    return contacts;
+  } catch (err) {
+    log(`❌ Error fetching contacts for ${user.username}: ${err.message}`);
+    return [];
+  }
+}
+
+async function getCalendarFromIceWarpForUser(user) {
+  try {
+    const client = getWebDAVClient();
+    const calPath = `/users/${user.username}/Calendar/`; // adjust as needed
+    log(`🔎 Listing calendar folder: ${calPath}`);
+    const list = await client.getDirectoryContents(calPath);
+    if (!list || !list.length) { log(`⚠️ No calendar files for ${user.username}`); return []; }
+
+    const icsFiles = list.filter(i => i.type === 'file' && i.basename && i.basename.toLowerCase().endsWith('.ics'));
+    const events = [];
+    for (const f of icsFiles) {
+      try {
+        const content = await client.getFileContents(f.filename, { format: "text" });
+        const parsed = parseICS(content, user.TimeZone || 'UTC');
+        events.push(...parsed);
+      } catch (err) {
+        log(`❌ Failed to read ${f.filename} for ${user.username}: ${err.message}`);
+      }
+    }
+    log(`📥 Parsed ${events.length} calendar events for ${user.username}`);
+    return events;
+  } catch (err) {
+    log(`❌ Error fetching calendar for ${user.username}: ${err.message}`);
+    return [];
+  }
+}
+
+/* ============================
+   Graph import helpers with batching & retry
+   ============================ */
+async function retryWithBackoff(fn, attempts = CONFIG.GraphRetryAttempts, baseMs = CONFIG.GraphRetryBaseMs) {
+  let i=0;
+  while (i < attempts) {
+    try { return await fn(); } catch (err) {
+      i++;
+      if (i >= attempts) throw err;
+      const waitMs = baseMs * Math.pow(2, i-1) + Math.floor(Math.random()*100);
+      log(` ⏳ retry #${i} after ${waitMs}ms due to: ${err.message}`);
+      await new Promise(r=>setTimeout(r, waitMs));
+    }
+  }
+}
+
+async function importContactsToM365ForUser(token, user, contacts) {
+  if (!contacts.length) { log(`ℹ️ No contacts to import for ${user.username}`); return; }
+  log(`⬆️ Importing ${contacts.length} contacts to ${user.username}`);
+  const endpoint = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.username)}/contacts`;
+
+  // batch in parallel groups
+  for (let i=0;i<contacts.length;i+=CONFIG.GraphBatchSize) {
+    const batch = contacts.slice(i, i+CONFIG.GraphBatchSize);
+    await Promise.all(batch.map(contact => retryWithBackoff(async () => {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(contact)
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(()=>({}));
+        throw new Error(data.error?.message || `HTTP ${res.status}`);
+      }
+      log(`✅ Contact created for ${user.username}: ${contact.givenName || contact.emailAddresses?.[0]?.address || '(no name)'}`);
+    })));
+  }
+}
+
+async function importEventsToM365ForUser(token, user, events) {
+  if (!events.length) { log(`ℹ️ No events to import for ${user.username}`); return; }
+  log(`⬆️ Importing ${events.length} events to ${user.username}`);
+  const endpoint = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(user.username)}/calendar/events`;
+
+  for (let i=0;i<events.length;i+=CONFIG.GraphBatchSize) {
+    const batch = events.slice(i, i+CONFIG.GraphBatchSize);
+    await Promise.all(batch.map(ev => retryWithBackoff(async () => {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(ev)
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(()=>({}));
+        throw new Error(data.error?.message || `HTTP ${res.status}`);
+      }
+      log(`✅ Event created for ${user.username}: ${ev.subject || '(no subject)'}`);
+    })));
+  }
+}
+
+/* ============================
+   Main orchestration
+   ============================ */
+async function runExport() {
+  clearLog();
+  log('🚀 Starting export run at', new Date().toISOString());
+
+  let token;
+  try {
+    token = await getGraphToken();
+  } catch (err) {
+    log('❌ Auth error:', err.message);
+    return;
+  }
+
+  let users;
+  try {
+    users = await discoverIceWarpUsers();
+  } catch (err) {
+    log('❌ User discovery error:', err.message);
+    return;
+  }
+
+  for (const user of users) {
+    log('\n📁 Processing user:', user.username);
+    try {
+      const contacts = await getContactsFromIceWarpForUser(user);
+      await importContactsToM365ForUser(token, user, contacts);
+    } catch (err) {
+      log(`❌ Contacts pipeline error for ${user.username}: ${err.message}`);
+    }
+
+    try {
+      const events = await getCalendarFromIceWarpForUser(user);
+      await importEventsToM365ForUser(token, user, events);
+    } catch (err) {
+      log(`❌ Calendar pipeline error for ${user.username}: ${err.message}`);
+    }
+  }
+
+  log('\n🎉 Export finished at', new Date().toISOString());
+}
+
+/* ============================
+   Wire UI
+   ============================ */
+document.getElementById('startBtn').addEventListener('click', async () => {
+  document.getElementById('startBtn').disabled = true;
+  try {
+    await runExport();
+  } catch (err) {
+    log('❌ Fatal error:', err.message);
+  } finally {
+    document.getElementById('startBtn').disabled = false;
+  }
+});
+
+/* ============================
+   End of file
+   ============================ */
+
+/*
+  NOTES & NEXT STEPS (production suggestions)
+  - Do NOT place client_secret in front-end code. Move getGraphToken() to a secure backend and return only a short-lived token or proxy requests.
+  - IceWarp folder layout may vary. Adjust paths for Contacts and Calendar folders.
+  - This parser is intentionally lightweight. If vCards are complex (encodings, non-ASCII, multiple ADR types) or ICS uses timezones (TZID), consider using robust libraries server-side:
+     - vCard: npm 'vcard-parser' or 'vcf'
+     - iCal: 'ical.js' or 'ical.js' on Node
+  - Consider Microsoft Graph rate limits — implement throttling (HTTP 429 handling).
+  - Add tracking CSV/DB to report successful/failed imports.
+*/
+</script>
+</body>
+</html>
